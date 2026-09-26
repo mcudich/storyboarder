@@ -11,7 +11,9 @@ module.exports = class LinkedFileManager {
     this.activateBoard = this.activateBoard.bind(this)
   }
 
-  addBoard (board, options = { skipTimestamp: false }) {
+  // changes saved to the linked file after `options.timestamp` will be imported
+  // (defaults to the file's current modification time)
+  addBoard (board, options = {}) {
     console.log('LinkedFileManager#addBoard', board)
 
     let filepath = this.getFilepath(board.link)
@@ -19,8 +21,8 @@ module.exports = class LinkedFileManager {
     this.linkedFiles.set(board.link, {
       link: board.link,
       filepath: filepath,
-      timestamp: options.skipTimestamp
-        ? null
+      timestamp: options.timestamp != null
+        ? options.timestamp
         : this.getTimestamp(filepath)
     })
   }
@@ -62,8 +64,9 @@ module.exports = class LinkedFileManager {
     console.log('LinkedFileManager#getChangeTime', { linkedFile })
     let timestamp = this.getTimestamp(linkedFile.filepath)
 
+    // a missing file has nothing to import
     if (timestamp == null) {
-      return timestamp
+      return false
     } else if (timestamp > linkedFile.timestamp) {
       return timestamp
     } else {
@@ -77,7 +80,12 @@ module.exports = class LinkedFileManager {
   
   getTimestamp (filepath) {
     console.log('getTimestamp', { filepath })
-    return fs.statSync(filepath).mtimeMs
+    try {
+      return fs.statSync(filepath).mtimeMs
+    } catch (err) {
+      if (err.code === 'ENOENT') return null
+      throw err
+    }
   }
 
   dispose() {

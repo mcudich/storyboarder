@@ -828,6 +828,18 @@ const migrateScene = () => {
   }
 }
 
+// when the board's layer images were last saved
+const getBoardArtworkModifiedTime = board => {
+  let mtimes = boardModel.boardOrderedLayerFilenames(board).filenames.map(filename => {
+    try {
+      return fs.statSync(path.join(boardPath, 'images', filename)).mtimeMs
+    } catch (err) {
+      return 0
+    }
+  })
+  return Math.max(0, ...mtimes)
+}
+
 // NOTE we assume that all resources (board data and images) are saved BEFORE calling verifyScene
 const verifyScene = async () => {
   // find all used files
@@ -888,9 +900,10 @@ const verifyScene = async () => {
   // setup LinkedFileManager
   if (linkedFileManager) { linkedFileManager.dispose() }
   linkedFileManager = new LinkedFileManager({ storyboarderFilePath: boardFilename })
+  // import PSDs saved after the board's artwork was last saved (e.g.: while Storyboarder was closed)
   boardData.boards
     .filter(b => b.link)
-    .forEach(b => linkedFileManager.addBoard(b, { skipTimestamp: true }))
+    .forEach(b => linkedFileManager.addBoard(b, { timestamp: getBoardArtworkModifiedTime(b) }))
 
 
   let boardsWithMissingPosterFrames = []
@@ -2786,7 +2799,13 @@ let openInEditor = async () => {
 
           namedCanvases.push({
             canvas,
-            name: layer.name
+            name: layer.name,
+            // match the reference layer opacity used by exporters/common
+            opacity: (layer.name === 'reference')
+              ? (board.layers.reference.opacity != null
+                ? board.layers.reference.opacity
+                : exporterCommon.DEFAULT_REFERENCE_LAYER_OPACITY)
+              : undefined
           })
         } else {
           // blank transparent layer
@@ -2967,70 +2986,86 @@ const refreshLinkedBoardByFilename = async (filename, options = { forceReadFromF
     )
 
     log.info('\treading', path.join(boardPath, 'images', board.link))
-    let canvas = importerPsd.fromPsdBufferComposite(buffer)
+    let { layers, flattenedReason } = importerPsd.fromPsdBufferForBoard(buffer, {
+      width: storyboarderSketchPane.sketchPane.width,
+      height: storyboarderSketchPane.sketchPane.height
+    })
 
-    let layer = storyboarderSketchPane.sketchPane.layers.findByName('reference')
+    if (flattenedReason) {
+      log.info('\tusing flattened image because', flattenedReason)
+      notifications.notify({
+        message: `${board.link} was imported as a single reference layer because ${flattenedReason}.`
+      })
+    }
 
-    // ensure layer data exists
-    log.info('\tupdating layer data')
+    let shouldUpdateSketchPane = isCurrentBoard && !options.forceReadFromFiles
 
-    // clear all non-reference layers
-    log.info(
-      'clearing non-reference layers from data' +
-      isCurrentBoard
-        ? ' and SketchPane'
-        : ''
-    )
+    log.info('\tisCurrentBoard?', isCurrentBoard)
+    if (shouldUpdateSketchPane) {
+      // save undo state for ALL layers
+      log.info('\tstoring undoable state (pre)')
+      storeUndoStateForImage(true, storyboarderSketchPane.visibleLayersIndices)
+    }
+
+    // replace each layer with the PSD's, and clear the layers the PSD doesn't have
+    //
     // NOTE gets layer indexes and names from CURRENT board,
     //      even if we're operating on a NON-CURRENT board
     //      we're assuming here that ALL boards have the SAME
     //      layer indexes and names
+    log.info('\tupdating layer data')
+    let replacedIndices = []
     for (let index of storyboarderSketchPane.visibleLayersIndices) {
-      let layerName = storyboarderSketchPane.sketchPane.layers[index].name
+      let layer = storyboarderSketchPane.sketchPane.layers[index]
+      let canvas = layers[layer.name]
 
-      if (layerName !== 'reference') {
-        if (isCurrentBoard && !options.forceReadFromFiles) {
-          log.info('\t\t', layerName, 'sketchpane layer cleared')
-          storyboarderSketchPane.sketchPane.layers.findByName(layerName).clear()
+      if (canvas) {
+        let layerFilename = boardModel.boardFilenameForLayer(board, layer.name)
+        board.layers[layer.name] = {
+          ...board.layers[layer.name],
+          url: layerFilename
         }
 
-        if (board.layers[layerName]) {
-          log.info('\t\t', layerName, 'data cleared')
-          delete board.layers[layerName]
+        if (shouldUpdateSketchPane) {
+          log.info('\t\t', layer.name, 'sketchpane layer replaced')
+          layer.replace(canvas)
+          replacedIndices.push(index)
+        } else {
+          log.info('\t\t', layer.name, 'saving to:', layerFilename)
+          saveDataURLtoFile(canvas.toDataURL(), layerFilename)
+        }
+      } else {
+        if (shouldUpdateSketchPane) {
+          log.info('\t\t', layer.name, 'sketchpane layer cleared')
+          layer.clear()
+        }
+
+        if (board.layers[layer.name]) {
+          log.info('\t\t', layer.name, 'data cleared')
+          delete board.layers[layer.name]
           // NOTE we DO NOT delete the PNG file from the file system
         }
       }
     }
-    log.info('\tupdating reference layer data')
-    let filename = boardModel.boardFilenameForLayer(board, layer.name)
-    board.layers.reference = {
-      ...board.layers.reference,
-      url: filename,
-      opacity: 1.0
+
+    // the flattened image already includes the reference layer's opacity
+    if (flattenedReason && board.layers.reference) {
+      board.layers.reference.opacity = 1.0
     }
-    // sync opacity
-    layersEditor.setReferenceOpacity(board.layers.reference.opacity)
     // mark to be saved
     markBoardFileDirty() // NOTE ALWAYS results in a JSON update, even if data
                          // hasn't actually changed
 
-    log.info('\tisCurrentBoard?', isCurrentBoard)
-    if (isCurrentBoard && !options.forceReadFromFiles) {
-      // save undo state for ALL layers
-      log.info('\tstoring undoable state (pre)')
-      storeUndoStateForImage(true, storyboarderSketchPane.visibleLayersIndices)
+    if (shouldUpdateSketchPane) {
+      // sync opacity
+      layersEditor.loadReferenceOpacity(board)
 
-      // update reference layer
-      log.info('\tstamping to reference layer')
-      layer.replace(canvas)
-
-      // store undo state for reference layer
       log.info('\tmarking undo-able (post)')
-      storeUndoStateForImage(false, [layer.index])
+      storeUndoStateForImage(false, storyboarderSketchPane.visibleLayersIndices)
 
-      // mark the reference layer dirty
-      log.info('\tmarking layer dirty so it will save', layer.index)
-      markImageFileDirty([layer.index])
+      // mark the replaced layers dirty
+      log.info('\tmarking layers dirty so they will save', replacedIndices)
+      markImageFileDirty(replacedIndices)
 
       // uncomment to save image and update thumbnail immediately
       // await saveImageFile()
@@ -3043,9 +3078,6 @@ const refreshLinkedBoardByFilename = async (filename, options = { forceReadFromF
       log.info('\trendering thumbnail')
       renderThumbnailDrawer()
     } else {
-      log.info('\tsaving reference layer to:', filename)
-      saveDataURLtoFile(canvas.toDataURL(), filename)
-
       // update the thumbnail
       //
       // explicitly indicate to renderer that the thumbnail file has changed
